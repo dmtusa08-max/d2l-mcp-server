@@ -20,6 +20,13 @@ const SSO_IDP = process.env.D2L_SSO_IDP;
 // updates itself. Set D2L_BROWSER_CHANNEL=bundled to force Playwright's Chromium.
 const BROWSER_CHANNEL = process.env.D2L_BROWSER_CHANNEL || 'chrome';
 
+// How long to allow when a human is actually typing at the identity provider.
+// Institutional SSO often adds MFA - a push notification or a code from a phone -
+// which routinely takes longer than a minute. Time out too early and the browser
+// closes after the IdP has authenticated but before it redirects back to D2L,
+// leaving IdP cookies saved but no D2L session at all.
+const MANUAL_LOGIN_TIMEOUT = Number(process.env.D2L_LOGIN_TIMEOUT_MS) || 300000;
+
 /**
  * Open the persistent D2L session profile. Prefers the system Chrome channel and
  * falls back to Playwright's bundled Chromium if that channel is not installed.
@@ -146,7 +153,7 @@ async function captureToken(context: BrowserContext, quickCheck: boolean): Promi
     // Try to start SSO automatically.
     // The saved browser session should carry us through the IdP without user interaction.
     try {
-      const started = await startSsoLogin(page, quickCheck ? 15000 : 60000);
+      const started = await startSsoLogin(page, quickCheck ? 15000 : MANUAL_LOGIN_TIMEOUT);
       if (started) {
         await page.waitForLoadState('networkidle');
       } else if (quickCheck) {
@@ -164,7 +171,7 @@ async function captureToken(context: BrowserContext, quickCheck: boolean): Promi
   }
 
   // Wait for token capture
-  const maxWait = quickCheck ? 10000 : 120000;
+  const maxWait = quickCheck ? 10000 : MANUAL_LOGIN_TIMEOUT;
   const startTime = Date.now();
 
   while (Date.now() - startTime < maxWait) {
@@ -174,8 +181,14 @@ async function captureToken(context: BrowserContext, quickCheck: boolean): Promi
       // We're logged in, wait for API calls
       if (!capturedToken) {
         await page.waitForTimeout(2000);
-        // Try scrolling to trigger more API calls
-        await page.evaluate(() => window.scrollBy(0, 100));
+        // Try scrolling to trigger more API calls. The page can navigate out from
+        // under us mid-SSO, which destroys the execution context - that is a normal
+        // race here, not a failure, so keep waiting rather than aborting the run.
+        try {
+          await page.evaluate(() => window.scrollBy(0, 100));
+        } catch {
+          // navigated while evaluating; the loop will re-check on the next pass
+        }
         await page.waitForTimeout(1000);
       }
 
@@ -228,7 +241,7 @@ export async function getAuthenticatedContext(): Promise<BrowserContext> {
   if (isLoginPage(currentUrl)) {
     // Try SSO auto-login
     try {
-      const started = await startSsoLogin(page, hasExistingSession ? 15000 : 60000);
+      const started = await startSsoLogin(page, hasExistingSession ? 15000 : MANUAL_LOGIN_TIMEOUT);
       if (!started) {
         throw new Error('No recognised SSO entry point on the login page');
       }
@@ -243,7 +256,7 @@ export async function getAuthenticatedContext(): Promise<BrowserContext> {
         await newPage.goto(HOME_URL, { waitUntil: 'domcontentloaded' });
         
         // Wait for user to complete login
-        await newPage.waitForURL(url => !isLoginPage(url.toString()), { timeout: 120000 });
+        await newPage.waitForURL(url => !isLoginPage(url.toString()), { timeout: MANUAL_LOGIN_TIMEOUT });
         await newPage.close();
       }
     }
