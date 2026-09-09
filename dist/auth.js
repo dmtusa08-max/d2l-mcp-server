@@ -73,6 +73,49 @@ async function startSsoLogin(page, timeout) {
     }
     return false;
 }
+/**
+ * Ask D2L for a token directly, from inside the authenticated page.
+ *
+ * Waiting to sniff an Authorization header off a request the page happens to
+ * make is a race: some Brightspace instances make no such call on the home page
+ * within the wait window, so capture times out even though login succeeded.
+ * Brightspace's own front end mints its token from this endpoint, so requesting
+ * it is deterministic. Returns null if the instance does not answer as expected,
+ * leaving the header-sniffing path as a fallback.
+ */
+async function fetchTokenFromPage(page) {
+    try {
+        return await page.evaluate(async () => {
+            const xsrfRes = await fetch('/d2l/lp/auth/xsrf-info', {
+                credentials: 'include',
+                headers: { Accept: 'application/json' },
+            });
+            if (!xsrfRes.ok)
+                return null;
+            const xsrf = await xsrfRes.json();
+            const csrf = xsrf?.referrerToken;
+            if (!csrf)
+                return null;
+            const tokenRes = await fetch('/d2l/lp/auth/oauth2/token', {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    'X-Csrf-Token': csrf,
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: 'scope=*:*:*',
+            });
+            if (!tokenRes.ok)
+                return null;
+            const data = await tokenRes.json();
+            return typeof data?.access_token === 'string' ? data.access_token : null;
+        });
+    }
+    catch {
+        // Page navigated mid-request, or the endpoint is not available here.
+        return null;
+    }
+}
 export async function getToken() {
     // Return cached token if still valid (with 5 min buffer)
     if (tokenCache.token && Date.now() < tokenCache.expiresAt - 300000) {
@@ -150,6 +193,15 @@ async function captureToken(context, quickCheck) {
     while (Date.now() - startTime < maxWait) {
         currentUrl = page.url();
         if (!isLoginPage(currentUrl)) {
+            // Logged in. Ask D2L for a token outright before falling back to waiting
+            // for one to appear on a request we can sniff.
+            if (!capturedToken) {
+                const requested = await fetchTokenFromPage(page);
+                if (requested) {
+                    capturedToken = requested;
+                    break;
+                }
+            }
             // We're logged in, wait for API calls
             if (!capturedToken) {
                 await page.waitForTimeout(2000);
