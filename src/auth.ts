@@ -13,6 +13,38 @@ const HOME_URL = `https://${D2L_HOST}/d2l/home`;
 // which provider to submit; leave it unset to accept whatever the page defaults to.
 const SSO_IDP = process.env.D2L_SSO_IDP;
 
+// Playwright ships its own Chromium, pinned to whatever version that Playwright
+// release was built against. It never auto-updates, so it steadily falls behind
+// real Chrome, and D2L eventually rejects it as an unsupported browser.
+// Driving the locally installed Google Chrome instead keeps us on a browser that
+// updates itself. Set D2L_BROWSER_CHANNEL=bundled to force Playwright's Chromium.
+const BROWSER_CHANNEL = process.env.D2L_BROWSER_CHANNEL || 'chrome';
+
+/**
+ * Open the persistent D2L session profile. Prefers the system Chrome channel and
+ * falls back to Playwright's bundled Chromium if that channel is not installed.
+ */
+async function launchContext(headless: boolean): Promise<BrowserContext> {
+  const options = { headless, viewport: { width: 1280, height: 720 } };
+
+  if (BROWSER_CHANNEL !== 'bundled') {
+    try {
+      return await chromium.launchPersistentContext(SESSION_PATH, {
+        ...options,
+        channel: BROWSER_CHANNEL,
+      });
+    } catch (error) {
+      const reason = (error as Error).message.split('\n')[0];
+      console.error(
+        `Could not launch browser channel "${BROWSER_CHANNEL}" (${reason}). ` +
+        `Falling back to Playwright's bundled Chromium, which D2L may reject as out of date.`
+      );
+    }
+  }
+
+  return chromium.launchPersistentContext(SESSION_PATH, options);
+}
+
 interface TokenCache {
   token: string;
   expiresAt: number;
@@ -62,10 +94,7 @@ export async function getToken(): Promise<string> {
   const hasExistingSession = existsSync(SESSION_PATH);
 
   // Always try headless first if session exists - only show browser if login needed
-  let context = await chromium.launchPersistentContext(SESSION_PATH, {
-    headless: hasExistingSession,
-    viewport: { width: 1280, height: 720 },
-  });
+  let context = await launchContext(hasExistingSession);
 
   try {
     const result = await captureToken(context, hasExistingSession);
@@ -74,10 +103,7 @@ export async function getToken(): Promise<string> {
     if (result.needsLogin && hasExistingSession) {
       await context.close();
       console.error('Session expired, opening browser for login...');
-      context = await chromium.launchPersistentContext(SESSION_PATH, {
-        headless: false,
-        viewport: { width: 1280, height: 720 },
-      });
+      context = await launchContext(false);
       const retryResult = await captureToken(context, false);
       tokenCache = {
         token: retryResult.token,
@@ -191,10 +217,7 @@ export function getTokenExpiry(): number {
 export async function getAuthenticatedContext(): Promise<BrowserContext> {
   const hasExistingSession = existsSync(SESSION_PATH);
 
-  let context = await chromium.launchPersistentContext(SESSION_PATH, {
-    headless: hasExistingSession,
-    viewport: { width: 1280, height: 720 },
-  });
+  let context = await launchContext(hasExistingSession);
 
   const page = await context.newPage();
   
@@ -215,10 +238,7 @@ export async function getAuthenticatedContext(): Promise<BrowserContext> {
       if (hasExistingSession) {
         await context.close();
         console.error('Session expired, opening browser for login...');
-        context = await chromium.launchPersistentContext(SESSION_PATH, {
-          headless: false,
-          viewport: { width: 1280, height: 720 },
-        });
+        context = await launchContext(false);
         const newPage = await context.newPage();
         await newPage.goto(HOME_URL, { waitUntil: 'domcontentloaded' });
         
