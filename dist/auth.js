@@ -5,9 +5,40 @@ import { existsSync } from 'fs';
 const SESSION_PATH = join(homedir(), '.d2l-session');
 const D2L_HOST = process.env.D2L_HOST || 'learn.ul.ie';
 const HOME_URL = `https://${D2L_HOST}/d2l/home`;
+// Some D2L instances federate to several identity providers and show a picker
+// (a <select id="entityId"> plus a "Go" button) instead of a single SSO button.
+// Broward College (bconline.broward.edu) is one of these. D2L_SSO_IDP chooses
+// which provider to submit; leave it unset to accept whatever the page defaults to.
+const SSO_IDP = process.env.D2L_SSO_IDP;
 let tokenCache = { token: '', expiresAt: 0 };
 function isLoginPage(url) {
     return url.includes('login') || url.includes('microsoftonline') || url.includes('sso') || url.includes('adfs');
+}
+/**
+ * Kick off whichever SSO entry point this D2L instance uses, then wait until we
+ * land on a non-login URL. Returns false if no known entry point is on the page,
+ * which means the user has to complete the login by hand.
+ */
+async function startSsoLogin(page, timeout) {
+    // Identity-provider picker (Broward College and other SAML-federated instances).
+    const idpSelect = page.locator('select#entityId');
+    if (await idpSelect.isVisible({ timeout: 2000 }).catch(() => false)) {
+        if (SSO_IDP) {
+            await idpSelect.selectOption(SSO_IDP);
+        }
+        // The Go button's id is generated per-render, so match on class + label instead.
+        await page.locator('button.d2l-button:has-text("Go"), button:has-text("Go")').first().click();
+        await page.waitForURL((url) => !isLoginPage(url.toString()), { timeout });
+        return true;
+    }
+    // Single-button SSO (University of Limerick and similar).
+    const ssoButton = page.locator('button.d2l-button-sso-1, button:has-text("Student & Staff Login")');
+    if (await ssoButton.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await ssoButton.click();
+        await page.waitForURL((url) => !isLoginPage(url.toString()), { timeout });
+        return true;
+    }
+    return false;
 }
 export async function getToken() {
     // Return cached token if still valid (with 5 min buffer)
@@ -65,15 +96,17 @@ async function captureToken(context, quickCheck) {
     // Check if we're on login page
     let currentUrl = page.url();
     if (isLoginPage(currentUrl)) {
-        // Try to click the SSO login button automatically
-        // The saved browser session should handle Microsoft SSO without user interaction
+        // Try to start SSO automatically.
+        // The saved browser session should carry us through the IdP without user interaction.
         try {
-            const ssoButton = page.locator('button.d2l-button-sso-1, button:has-text("Student & Staff Login")');
-            if (await ssoButton.isVisible({ timeout: 2000 })) {
-                await ssoButton.click();
-                // Wait for SSO redirect and completion
-                await page.waitForURL(url => !isLoginPage(url.toString()), { timeout: quickCheck ? 15000 : 60000 });
+            const started = await startSsoLogin(page, quickCheck ? 15000 : 60000);
+            if (started) {
                 await page.waitForLoadState('networkidle');
+            }
+            else if (quickCheck) {
+                // Nothing we recognise to click, and we're headless - hand off to a real browser.
+                await page.close();
+                return { token: '', needsLogin: true };
             }
         }
         catch {
@@ -140,12 +173,11 @@ export async function getAuthenticatedContext() {
     if (isLoginPage(currentUrl)) {
         // Try SSO auto-login
         try {
-            const ssoButton = page.locator('button.d2l-button-sso-1, button:has-text("Student & Staff Login")');
-            if (await ssoButton.isVisible({ timeout: 2000 })) {
-                await ssoButton.click();
-                await page.waitForURL(url => !isLoginPage(url.toString()), { timeout: hasExistingSession ? 15000 : 60000 });
-                await page.waitForLoadState('domcontentloaded');
+            const started = await startSsoLogin(page, hasExistingSession ? 15000 : 60000);
+            if (!started) {
+                throw new Error('No recognised SSO entry point on the login page');
             }
+            await page.waitForLoadState('domcontentloaded');
         }
         catch {
             // If headless failed to auto-login, restart with visible browser
